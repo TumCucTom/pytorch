@@ -4757,6 +4757,52 @@ if HAS_CUDA_AND_TRITON:
                     # This test verifies we don't hit AssertionError.
                     break
 
+        def test_dealloc_handles_tensor_weakrefs_stack_traces_mismatch(self):
+            """Verify dealloc_current_path_weakrefs handles tensor_weakrefs /
+            stack_traces length mismatch without asserting.
+
+            tensor_weakrefs and stack_traces can diverge in length for the same
+            reason that outputs_weakrefs and stack_traces can — the existing
+            comment in dealloc_current_path_weakrefs documents that an internal
+            model hit the outputs_weakrefs mismatch but could not be repro'd.
+            The same divergence can occur for tensor_weakrefs. The fix replaces
+            the hard assert with a warning and relies on zip() to handle the
+            mismatch, matching the existing defensive pattern for
+            outputs_weakrefs in the same function.
+
+            See https://github.com/pytorch/pytorch/issues/154824
+            """
+
+            @torch.compile(mode="reduce-overhead")
+            def foo(x):
+                return x + 1
+
+            inp = torch.rand([4], device="cuda")
+
+            # First call: warmup phase — creates and runs a CUDAWarmupNode
+            torch.compiler.cudagraph_mark_step_begin()
+            foo(inp)
+
+            # Simulate the tensor_weakrefs / stack_traces length divergence.
+            # This mismatch can occur organically for the same reason the
+            # analogous outputs_weakrefs mismatch can (documented in the
+            # comment block inside dealloc_current_path_weakrefs).
+            node = self.curr_node()
+            self.assertEqual(
+                len(node.tensor_weakrefs), len(node.stack_traces)
+            )
+            node.tensor_weakrefs.append(None)
+
+            # Second call: transitions warmup -> recording, which invokes
+            # try_end_curr_warmup -> dealloc_current_path_weakrefs.
+            # cudagraph_mark_step_begin ensures can_start_new_generation()
+            # returns True so dealloc is actually called.
+            # Without the fix, this would hit:
+            #   assert len(node.tensor_weakrefs) == len(node.stack_traces)
+            # With the fix, zip() safely truncates to the shorter list.
+            torch.compiler.cudagraph_mark_step_begin()
+            foo(inp)
+
     class TestSAC(TestCase):
         def _make_observer_mode(self):
             class ObserverMode(TorchDispatchMode):
