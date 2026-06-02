@@ -408,12 +408,25 @@ class FSDPState(_State):
                         fsdp_param_group.finalize_backward()
             if self._state_ctx.is_last_backward:
                 self._comm_ctx.post_forward_order.clear()
-                # Catch the last module's RS states that no subsequent
-                # module's group N-1 wait will clear.
+                # Catch the last module's RS states that no subsequent module's
+                # group N-1 wait will clear. RS-stream-local inputs (copy-in ran
+                # on the RS stream) skip the compute-stream wait.
                 for rs_state in self._comm_ctx.reduce_scatter_states:
-                    if rs_state.event is not None:
+                    if (
+                        rs_state.needs_compute_stream_wait
+                        and rs_state.event is not None
+                    ):
                         self._device_handle.current_stream().wait_event(rs_state.event)
                 self._comm_ctx.reduce_scatter_states.clear()
+                # Grads read cross-stream by the RS-stream copy-in: barrier the
+                # compute stream past each copy-in before recycling the grad
+                # memory (keepalive + wait_event-before-del).
+                for g_state in self._comm_ctx.grad_reduce_states:
+                    if g_state.copy_in_event is not None:
+                        self._device_handle.current_stream().wait_event(
+                            g_state.copy_in_event
+                        )
+                self._comm_ctx.grad_reduce_states.clear()
             self._state_ctx.post_backward_final_callback_queued = False
 
     def _register_pre_backward_hook(self, output: Any) -> Any:
@@ -476,6 +489,10 @@ class FSDPState(_State):
             if rs_state.event is not None:
                 current_stream.wait_event(rs_state.event)
         self._comm_ctx.reduce_scatter_states.clear()
+        for g_state in self._comm_ctx.grad_reduce_states:
+            if g_state.copy_in_event is not None:
+                current_stream.wait_event(g_state.copy_in_event)
+        self._comm_ctx.grad_reduce_states.clear()
         for event in self._comm_ctx._last_post_reduce_events.values():
             current_stream.wait_event(event)
         self._comm_ctx._last_post_reduce_events.clear()

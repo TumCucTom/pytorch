@@ -535,6 +535,8 @@ def foreach_reduce(
     partial_reduce_output: torch.Tensor | None,  # only used for HSDP
     all_reduce_hook: Callable[[torch.Tensor], None] | None,
     force_sum_reduction_for_comms: bool = False,
+    copy_in_on_rs_stream: bool = False,
+    grad_reduce_state_out: list[Any] | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Event,
@@ -594,17 +596,46 @@ def foreach_reduce(
     )
     reduce_scatter_input_numel = sum(s.numel() for s in padded_unsharded_sizes)
     reduce_scatter_output_numel = reduce_scatter_input_numel // world_size
-    reduce_scatter_input = reduce_scatter_comm.allocate(
-        (reduce_scatter_input_numel,),
-        dtype=reduce_dtype,
-        device=device,
-    )
-
-    foreach_reduce_scatter_copy_in(unsharded_grads, reduce_scatter_input, world_size)
-
-    # Only after the copy-in finishes can we free the gradients
-    unsharded_grads.clear()
-    reduce_scatter_stream.wait_stream(current_stream)
+    # When the experimental flag is on, run the copy-in (chunk_cat) on the
+    # reduce-scatter stream instead of the current/compute stream. The grads are
+    # produced on the current stream, so the RS stream waits for them (consumer
+    # waits for producer); the RS-input buffer is RS-stream-local so its reuse
+    # never gates the compute stream. The grads are read here cross-stream, so
+    # we cannot free them immediately -- retain them plus a copy-in completion
+    # event and let the caller release them by polling the event (no
+    # record_stream). See agent_space/fsdp2_rs_copyin_stream_plan.md.
+    if copy_in_on_rs_stream:
+        reduce_scatter_stream.wait_stream(current_stream)
+        with device_handle.stream(reduce_scatter_stream):
+            reduce_scatter_input = reduce_scatter_comm.allocate(
+                (reduce_scatter_input_numel,),
+                dtype=reduce_dtype,
+                device=device,
+            )
+            foreach_reduce_scatter_copy_in(
+                unsharded_grads, reduce_scatter_input, world_size
+            )
+            # Defer freeing the full grads until the RS-stream copy-in
+            # completes: hand the refs + copy-in event back via the optional
+            # out-list. This keeps foreach_reduce's 7-tuple return contract
+            # unchanged (fully gated; engaged only when the caller opts in).
+            if grad_reduce_state_out is not None:
+                grad_reduce_state_out.append(
+                    (list(unsharded_grads), reduce_scatter_stream.record_event())
+                )
+            unsharded_grads.clear()
+    else:
+        reduce_scatter_input = reduce_scatter_comm.allocate(
+            (reduce_scatter_input_numel,),
+            dtype=reduce_dtype,
+            device=device,
+        )
+        foreach_reduce_scatter_copy_in(
+            unsharded_grads, reduce_scatter_input, world_size
+        )
+        # Only after the copy-in finishes can we free the gradients
+        unsharded_grads.clear()
+        reduce_scatter_stream.wait_stream(current_stream)
     all_reduce_input = None
     all_reduce_event = None
 
