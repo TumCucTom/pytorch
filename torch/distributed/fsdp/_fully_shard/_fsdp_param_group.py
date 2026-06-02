@@ -18,6 +18,7 @@ from torch.distributed.fsdp._common_utils import (
 from torch.profiler import record_function
 from torch.utils.hooks import RemovableHandle
 
+from . import _fsdp_common
 from ._fsdp_api import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
 from ._fsdp_collectives import (
     AllGather,
@@ -105,6 +106,9 @@ class FSDPCommContext:
         # CUDA events for synchronization
         self.all_gather_state: AllGatherState | None = None
         self.reduce_scatter_states: list[ReduceScatterState] = []
+        # Gradients retained for the RS-stream copy-in (experimental flag);
+        # released by polling their copy-in event (no record_stream).
+        self.grad_reduce_states: list[GradReduceState] = []
         # Post-forward order for explicit backward prefetching
         self.post_forward_order: list[FSDPParamGroup] = []  # will cause ref cycles
 
@@ -130,6 +134,14 @@ class AllGatherState(NamedTuple):
 class ReduceScatterState(NamedTuple):
     reduce_scatter_input: torch.Tensor
     event: torch.Event | None  # reduce-scatter event
+
+
+class GradReduceState(NamedTuple):
+    # Gradients retained so the reduce-scatter copy-in (run on the RS stream
+    # under the experimental flag) can read them; released by polling the
+    # copy-in event (no record_stream, no compute-stream wait).
+    grads: list[torch.Tensor]
+    copy_in_event: torch.Event | None
 
 
 class AllReduceState(NamedTuple):
@@ -631,9 +643,27 @@ class FSDPParamGroup:
             and self.comm_ctx.reduce_scatter_states
         ):
             with record_function(f"FSDP::post_backward_rs_wait ({self._module_fqn})"):
-                for rs_state in self.comm_ctx.reduce_scatter_states:
-                    if rs_state.event is not None:
-                        self.device_handle.current_stream().wait_event(rs_state.event)
+                if not _fsdp_common._RS_COPY_IN_ON_RS_STREAM:
+                    # RS-input lives on the compute stream; barrier before reuse.
+                    for rs_state in self.comm_ctx.reduce_scatter_states:
+                        if rs_state.event is not None:
+                            self.device_handle.current_stream().wait_event(
+                                rs_state.event
+                            )
+                else:
+                    # Flag path: RS-input is RS-stream-local (no wait needed),
+                    # but the full grads were read cross-stream by the RS-stream
+                    # copy-in. Keepalive + wait_event-before-del: barrier the
+                    # compute stream past each copy-in before recycling the
+                    # compute-stream-allocated grad memory. copy_in_event fires
+                    # before the reduce-scatter, so this is strictly cheaper than
+                    # the rs_event wait above.
+                    for g_state in self.comm_ctx.grad_reduce_states:
+                        if g_state.copy_in_event is not None:
+                            self.device_handle.current_stream().wait_event(
+                                g_state.copy_in_event
+                            )
+                    self.comm_ctx.grad_reduce_states.clear()
                 self.comm_ctx.reduce_scatter_states.clear()
         if len(fsdp_params_with_grad) == 0:
             return
@@ -655,6 +685,15 @@ class FSDPParamGroup:
             else:
                 all_reduce_stream = self.comm_ctx.all_reduce_stream
 
+            # Optional out-list for the RS-stream copy-in path, supplied only
+            # when the flag is on, so foreach_reduce keeps its 7-tuple return
+            # for every other caller -> the change is fully gated.
+            grad_reduce_out: list[Any] = []
+            grad_reduce_kwargs = (
+                {"grad_reduce_state_out": grad_reduce_out}
+                if _fsdp_common._RS_COPY_IN_ON_RS_STREAM
+                else {}
+            )
             self._wait_for_post_backward()
             (
                 reduce_scatter_input,
@@ -689,6 +728,7 @@ class FSDPParamGroup:
                 self._partial_reduce_output,
                 self._all_reduce_hook,
                 self.force_sum_reduction_for_comms,
+                **grad_reduce_kwargs,
             )
             self.comm_ctx._last_post_reduce_events[post_reduce_stream] = (
                 self._post_reduce_event
@@ -696,6 +736,11 @@ class FSDPParamGroup:
             self.comm_ctx.reduce_scatter_states.append(
                 ReduceScatterState(reduce_scatter_input, reduce_scatter_event)
             )
+            if grad_reduce_out:
+                retained_grads, copy_in_event = grad_reduce_out[0]
+                self.comm_ctx.grad_reduce_states.append(
+                    GradReduceState(retained_grads, copy_in_event)
+                )
             if is_partial_group_backward:
                 # Serialize the default stream on this invocation's
                 # post-accumulate event before returning to autograd.
