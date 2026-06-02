@@ -364,6 +364,44 @@ class TestDynamismExpression(TestCase):
             dynamic_shapes=dynamic_shapes,
         )
 
+    def _check_export_slice_static_bound_crosses_dynamic_dim(self, indices):
+        dynamic_shapes = {"x": {1: Dim("len", min=0, max=13)}}
+        for index in indices:
+            with self.subTest(index=index):
+
+                class Slice(torch.nn.Module):
+                    def forward(self, x):
+                        return x[:, index]
+
+                for width in (3, 8):
+                    x = torch.randn(4, width)
+                    ep = export(
+                        Slice(),
+                        (x,),
+                        dynamic_shapes=dynamic_shapes,
+                        strict=False,
+                    )
+                    self.assertEqual(len(ep.range_constraints), 1)
+                    for new_width in (0, 3, 5, 8, 13):
+                        y = torch.randn(4, new_width)
+                        self.assertEqual(ep.module()(y), y[:, index])
+
+    def test_export_slice_static_bound_crosses_dynamic_dim(self):
+        self._check_export_slice_static_bound_crosses_dynamic_dim((slice(None, 5),))
+
+    @testing.expectedFailureTrainingIRToRunDecomp
+    @testing.expectedFailureTrainingIRToRunDecompNonStrict
+    def test_export_slice_static_bound_crosses_dynamic_dim_variants(self):
+        self._check_export_slice_static_bound_crosses_dynamic_dim(
+            (
+                slice(5, None),
+                slice(None, -5),
+                slice(-5, None),
+                slice(3, 5),
+                slice(-5, -2),
+            )
+        )
+
     def test_no_grad_param_inplace(self):
         class Foo(torch.nn.Module):
             def __init__(self):
@@ -4437,8 +4475,9 @@ def forward(self, causal_mask, fill_value):
         class Foo(torch.nn.Module):
             def forward(self, xs):
                 x, y = xs["data"][0]
+                assert x.shape[0] >= 8  # noqa: S101
                 assert y.shape[0] <= 32  # noqa: S101
-                return x[6:], y + 2
+                return x + 1, y + 2
 
         x, y = torch.randn(8), torch.randn(8)
 
@@ -6322,9 +6361,13 @@ def forward(self, p_linear_weight, p_linear_bias, b_buffer, x):
             # 4->2, 4->2, 3->3
             bad_args=(torch.randn(2), [torch.randn(2)], {"k": torch.randn(3)}),
             run_time_msg=escape(
-                "Guard failed: x.size()[0] >= 3"
+                "Guard failed: min(3, y[0].size()[0]) == 3"
             ),  # expected >= 3, but got 2
-            compile_time_msg="Expected input.*to be >= 3, but got 2",
+            compile_time_msg=escape(
+                "Expected additional input to satisfy the exported program, "
+                "but got runtime assertion error: Guard failed: "
+                "min(3, y[0].size()[0]) == 3"
+            ),
         )
 
         expect_error(
@@ -6342,7 +6385,7 @@ def forward(self, p_linear_weight, p_linear_bias, b_buffer, x):
             run_time_msg=escape(
                 "Guard failed: z['k'].size()[0] == 3"
             ),  # expected 3, but got 4
-            compile_time_msg=r"You marked.*but your code specialized it to be a constant.*If you're using Dim.DYNAMIC, replace it with either Dim.STATIC or Dim.AUTO",
+            compile_time_msg=r"Expected input.*shape\[0\] to be <= 3, but got 4",
         )
 
     def test_additional_inputs_constants(self):
@@ -6416,6 +6459,33 @@ def forward(self, p_linear_weight, p_linear_bias, b_buffer, x):
             r"differing types, so they cannot be marked as dynamic: \(0, 0, False\)",
         ):
             torch.export.export(M(), input1, dynamic_shapes=ai)
+
+    def test_additional_inputs_verify_does_not_mutate(self):
+        class InputMutation(torch.nn.Module):
+            def forward(self, x):
+                x.add_(1)
+                return x
+
+        input1 = (torch.zeros(3),)
+        input2 = (torch.zeros(4),)
+        ai = torch.export.AdditionalInputs()
+        ai.add(input2)
+
+        torch.export.export(InputMutation(), input1, dynamic_shapes=ai)
+        self.assertEqual(input2[0], torch.zeros(4))
+
+        class BufferMutation(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("buf", torch.zeros(1))
+
+            def forward(self, x):
+                self.buf.add_(1)
+                return x + self.buf
+
+        mod = BufferMutation()
+        torch.export.export(mod, input1, dynamic_shapes=ai)
+        self.assertEqual(mod.buf, torch.zeros(1))
 
     def test_mismatched_dynamic_shapes(self):
         AUTO, STATIC = Dim.AUTO, Dim.STATIC
@@ -13298,13 +13368,21 @@ graph():
         for z in zs:
             dynamic_shapes[z] = (Dim.DYNAMIC, Dim.DYNAMIC)
 
+        ep = export(m, (x, y, zs), dynamic_shapes=dynamic_shapes)
+        self.assertEqual(ep.module()(x, y, zs), m(x, y, zs))
+
+        x_valid = torch.randn(3, 5)
+        y_valid = torch.randn(3, 6)
+        zs_valid = [torch.randn(2, 5), torch.randn(4, 5)]
+        self.assertEqual(
+            ep.module()(x_valid, y_valid, zs_valid), m(x_valid, y_valid, zs_valid)
+        )
+
         with self.assertRaisesRegex(
-            torch._dynamo.exc.UserError,
-            r"Constraints violated.*\n.*"
-            r"You marked L\['y'\].size\(\)\[0\] as dynamic but your code specialized it to be a constant \(3\).*"
-            r"If you're using Dim.DYNAMIC, replace it with either Dim.STATIC or Dim.AUTO.",
+            AssertionError,
+            escape("Guard failed: min(3, x.size()[0]) == y.size()[0]"),
         ):
-            export(m, (x, y, zs), dynamic_shapes=dynamic_shapes)
+            ep.module()(torch.randn(5, 5), torch.randn(2, 6), zs)
 
     def test_unflatten_random_dag_const_preserving_3_1(self):
         class N2(torch.nn.Module):
@@ -16983,7 +17061,7 @@ def forward(self, x):
                 for node in ep.graph.nodes
             ].count(True)
             if private_api:
-                self.assertEqual(num_asserts, 6)
+                self.assertEqual(num_asserts, 3)
                 with self.assertRaisesRegex(
                     RuntimeError,
                     r"Runtime assertion failed for expression Eq\(Mod\(s27\*s77, s77 - 1\), 0\)",
