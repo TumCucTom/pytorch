@@ -412,7 +412,10 @@ class FSDPState(_State):
                 # group N-1 wait will clear. RS-stream-local inputs (copy-in ran
                 # on the RS stream) skip the compute-stream wait.
                 for rs_state in self._comm_ctx.reduce_scatter_states:
-                    if rs_state.needs_compute_stream_wait and rs_state.event is not None:
+                    if (
+                        rs_state.needs_compute_stream_wait
+                        and rs_state.event is not None
+                    ):
                         self._device_handle.current_stream().wait_event(rs_state.event)
                 self._comm_ctx.reduce_scatter_states.clear()
                 # Grads read cross-stream by the RS-stream copy-in: barrier the

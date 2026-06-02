@@ -655,7 +655,10 @@ class FSDPParamGroup:
                 # (copy-in ran on the RS stream) are recycled by same-stream
                 # ordering and skip the wait.
                 for rs_state in self.comm_ctx.reduce_scatter_states:
-                    if rs_state.needs_compute_stream_wait and rs_state.event is not None:
+                    if (
+                        rs_state.needs_compute_stream_wait
+                        and rs_state.event is not None
+                    ):
                         self.device_handle.current_stream().wait_event(rs_state.event)
                 self.comm_ctx.reduce_scatter_states.clear()
                 # Grads read cross-stream by the RS-stream copy-in: barrier the
@@ -695,7 +698,7 @@ class FSDPParamGroup:
             # 7-tuple return for every other caller -> fully gated.
             copy_in_on_rs_stream = self.reduce_scatter_copy_in_on_rs_stream
             grad_reduce_out: list[Any] = []
-            grad_reduce_kwargs = (
+            grad_reduce_kwargs: dict[str, Any] = (
                 {
                     "copy_in_on_rs_stream": True,
                     "grad_reduce_state_out": grad_reduce_out,
