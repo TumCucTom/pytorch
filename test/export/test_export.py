@@ -3891,6 +3891,126 @@ graph():
         ep = export(Vmap(), inputs, {}, dynamic_shapes=dynamic).run_decompositions({})
         self.assertTrue(torch.allclose(ep.module()(*inputs), Vmap()(*inputs)))
 
+    def test_subclass_constant_attr_pre_dispatch(self):
+        class Foo(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.p1 = CustomTensorPlainOut(torch.ones(3, 4), torch.ones(3, 4) * 2)
+
+            def forward(self, x):
+                return x + self.p1
+
+        m = Foo()
+        ref_x = torch.randn(3, 4)
+        ep = torch.export._trace._export(m, (ref_x,), strict=False, pre_dispatch=True)
+        self.assertIs(ep.constants["p1"], m.p1)
+        self.assertExpectedInline(
+            str(ep.graph).strip(),
+            """\
+graph():
+    %c_p1 : [num_users=1] = placeholder[target=c_p1]
+    %x : [num_users=1] = placeholder[target=x]
+    %add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%x, %c_p1), kwargs = {})
+    return (add,)""",
+        )
+        self.assertTrue(torch.allclose(ep.module()(ref_x), m(ref_x)))
+
+    def test_subclass_constant_attr_access_pre_dispatch(self):
+        class Foo(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.p1 = TwoTensor(torch.ones(3, 4), torch.ones(3, 4) * 2)
+
+            def forward(self, x):
+                return (x + self.p1).get_elem_a()
+
+        m = Foo()
+        ref_x = torch.randn(3, 4)
+        ep = torch.export._trace._export(m, (ref_x,), strict=False, pre_dispatch=True)
+        self.assertIs(ep.constants["p1"], m.p1)
+        self.assertExpectedInline(
+            str(ep.graph).strip(),
+            """\
+graph():
+    %c_p1 : [num_users=1] = placeholder[target=c_p1]
+    %x : [num_users=1] = placeholder[target=x]
+    %add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%x, %c_p1), kwargs = {})
+    %access_subclass_inner_tensor_default : [num_users=1] = call_function[target=torch.ops.export.access_subclass_inner_tensor.default](args = (%add, a), kwargs = {})
+    return (access_subclass_inner_tensor_default,)""",
+        )
+        self.assertTrue(torch.allclose(ep.module()(ref_x), m(ref_x)))
+
+    def test_subclass_constructed_in_forward_pre_dispatch(self):
+        class Foo(torch.nn.Module):
+            def forward(self, x):
+                p1 = CustomTensorPlainOut(torch.ones(3, 4), torch.ones(3, 4) * 2)
+                return x + p1
+
+        m = Foo()
+        ref_x = torch.randn(3, 4)
+        ep = torch.export._trace._export(m, (ref_x,), strict=False, pre_dispatch=True)
+        self.assertEqual(ep.constants, {})
+        FileCheck().check("torch.ops.higher_order.flat_apply").run(str(ep.graph))
+
+        actual = ep.module()(ref_x)
+        self.assertIs(type(actual), torch.Tensor)
+        self.assertTrue(torch.allclose(actual, m(ref_x)))
+
+    def test_subclass_constructed_in_forward_reused_pre_dispatch(self):
+        class Foo(torch.nn.Module):
+            def forward(self, x):
+                p1 = CustomTensorPlainOut(torch.ones(3, 4), torch.ones(3, 4) * 2)
+                return x + p1 + p1
+
+        m = Foo()
+        ref_x = torch.randn(3, 4)
+        ep = torch.export._trace._export(m, (ref_x,), strict=False, pre_dispatch=True)
+        self.assertEqual(ep.constants, {})
+        FileCheck().check_count(
+            "torch.ops.higher_order.flat_apply", 1, exactly=True
+        ).run(str(ep.graph))
+
+        actual = ep.module()(ref_x)
+        self.assertIs(type(actual), torch.Tensor)
+        self.assertTrue(torch.allclose(actual, m(ref_x)))
+
+    def test_subclass_constructed_in_forward_attr_access_pre_dispatch(self):
+        class Foo(torch.nn.Module):
+            def forward(self, x):
+                p1 = TwoTensor(torch.ones(3, 4), torch.ones(3, 4) * 2)
+                return (x + p1).get_elem_a()
+
+        m = Foo()
+        ref_x = torch.randn(3, 4)
+        ep = torch.export._trace._export(m, (ref_x,), strict=False, pre_dispatch=True)
+        self.assertEqual(ep.constants, {})
+        FileCheck().check("torch.ops.higher_order.flat_apply").check(
+            "torch.ops.export.access_subclass_inner_tensor"
+        ).run(str(ep.graph))
+
+        actual = ep.module()(ref_x)
+        self.assertIs(type(actual), torch.Tensor)
+        self.assertTrue(torch.allclose(actual, m(ref_x)))
+
+    def test_nested_subclass_constructed_in_forward_pre_dispatch(self):
+        class Foo(torch.nn.Module):
+            def forward(self, x):
+                inner1 = CustomTensorPlainOut(torch.ones(3, 4), torch.ones(3, 4) * 2)
+                inner2 = CustomTensorPlainOut(
+                    torch.ones(3, 4) * 3, torch.ones(3, 4) * 4
+                )
+                return x + CustomTensorPlainOut(inner1, inner2)
+
+        m = Foo()
+        ref_x = torch.randn(3, 4)
+        ep = torch.export._trace._export(m, (ref_x,), strict=False, pre_dispatch=True)
+        self.assertEqual(ep.constants, {})
+        FileCheck().check("torch.ops.higher_order.flat_apply").run(str(ep.graph))
+
+        actual = ep.module()(ref_x)
+        self.assertIs(type(actual), torch.Tensor)
+        self.assertTrue(torch.allclose(actual, m(ref_x)))
+
     @testing.expectedFailureLegacyExportNonStrict  # Old export doesn't work with subclasses
     @testing.expectedFailureLegacyExportStrict  # Old export doesn't work with subclasses
     def test_subclass_nested_attr_access(self):
@@ -3932,9 +4052,9 @@ graph():
     %add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%mul, %p_p2), kwargs = {})
     %add_1 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%add, %b_b1), kwargs = {})
     %sum_1 : [num_users=1] = call_function[target=torch.ops.aten.sum.default](args = (%add_1,), kwargs = {})
-    %access_subclass_inner_tensor_default_56 : [num_users=1] = call_function[target=torch.ops.export.access_subclass_inner_tensor.default](args = (%sum_1, a), kwargs = {})
-    %access_subclass_inner_tensor_default_61 : [num_users=1] = call_function[target=torch.ops.export.access_subclass_inner_tensor.default](args = (%access_subclass_inner_tensor_default_56, b), kwargs = {})
-    %add_2 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%x, %access_subclass_inner_tensor_default_61), kwargs = {})
+    %access_subclass_inner_tensor_default_24 : [num_users=1] = call_function[target=torch.ops.export.access_subclass_inner_tensor.default](args = (%sum_1, a), kwargs = {})
+    %access_subclass_inner_tensor_default_26 : [num_users=1] = call_function[target=torch.ops.export.access_subclass_inner_tensor.default](args = (%access_subclass_inner_tensor_default_24, b), kwargs = {})
+    %add_2 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%x, %access_subclass_inner_tensor_default_26), kwargs = {})
     return (add_2,)""",
         )
         ep = export(m, (ref_x,))
