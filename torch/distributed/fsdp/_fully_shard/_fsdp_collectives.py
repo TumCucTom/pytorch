@@ -11,7 +11,6 @@ from torch.distributed.distributed_c10d import ReduceOp
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter
 from torch.distributed.tensor import DTensor
 
-from . import _fsdp_common
 from ._fsdp_api import _ReduceOp
 from ._fsdp_common import (
     _get_dim0_padded_size,
@@ -536,6 +535,7 @@ def foreach_reduce(
     partial_reduce_output: torch.Tensor | None,  # only used for HSDP
     all_reduce_hook: Callable[[torch.Tensor], None] | None,
     force_sum_reduction_for_comms: bool = False,
+    copy_in_on_rs_stream: bool = False,
     grad_reduce_state_out: list[Any] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -604,7 +604,6 @@ def foreach_reduce(
     # we cannot free them immediately -- retain them plus a copy-in completion
     # event and let the caller release them by polling the event (no
     # record_stream). See agent_space/fsdp2_rs_copyin_stream_plan.md.
-    copy_in_on_rs_stream = _fsdp_common._RS_COPY_IN_ON_RS_STREAM
     if copy_in_on_rs_stream:
         reduce_scatter_stream.wait_stream(current_stream)
         with device_handle.stream(reduce_scatter_stream):

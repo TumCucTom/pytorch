@@ -1,7 +1,6 @@
 # mypy: allow-untyped-defs
 import functools
 import math
-import os
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -21,17 +20,6 @@ from ._fsdp_api import DataParallelMeshDims
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
-
-
-# Experimental (default off): run the FSDP2 reduce-scatter copy-in (chunk_cat)
-# on the reduce-scatter stream instead of the default/compute stream, so the
-# post-backward reduce never gates compute on RS-input buffer reuse. Gradient
-# lifetime is then managed by ref-hold + event.query() (no record_stream).
-# Toggle with env TORCH_FSDP2_RS_COPYIN_ON_RS_STREAM=1. See
-# code-review/agent_space/fsdp2_rs_copyin_stream_plan.md.
-_RS_COPY_IN_ON_RS_STREAM: bool = (
-    os.environ.get("TORCH_FSDP2_RS_COPYIN_ON_RS_STREAM", "0") == "1"
-)
 
 
 def _dynamo_disable(func: Callable[_P, _R]) -> Callable[_P, _R]:

@@ -704,6 +704,37 @@ class FSDPModule:
                         reduce_scatter_unused_params
                     )
 
+    def set_reduce_scatter_copy_in_on_rs_stream(
+        self, enable: bool = True, *, recurse: bool = True
+    ) -> None:
+        """
+        Sets whether to run the gradient reduce-scatter copy-in (``chunk_cat``)
+        on the reduce-scatter stream instead of the default/compute stream
+        (experimental, default off).
+
+        When the reduce-scatter is exposed (communication slower than the
+        backward compute meant to hide it), recycling the reduce-scatter input
+        buffer otherwise stalls the compute stream. Running the copy-in on the
+        reduce-scatter stream keeps that buffer reduce-scatter-stream-local so
+        the compute stream is not gated; the unsharded gradients read by the
+        copy-in are kept alive until the copy-in completes (no ``record_stream``).
+        This trades extra peak memory (the retained gradients) for better
+        overlap, and helps only when the reduce-scatter is exposed.
+
+        Args:
+            enable (bool): Whether to run the reduce-scatter copy-in on the
+                reduce-scatter stream.
+            recurse (bool): Whether to set for all FSDP submodules or just the
+                passed-in module.
+        """
+        self_module = cast(nn.Module, self)
+        modules = list(self_module.modules()) if recurse else [self_module]
+        for module in modules:
+            if isinstance(module, FSDPModule):
+                state = module._get_fsdp_state()
+                for fsdp_param_group in state._fsdp_param_groups:
+                    fsdp_param_group.reduce_scatter_copy_in_on_rs_stream = enable
+
     def set_unshard_in_backward(self, unshard_in_backward: bool) -> None:
         """
         Sets whether the FSDP module's parameters need to be unsharded in

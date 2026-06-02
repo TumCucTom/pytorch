@@ -19,7 +19,6 @@ from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.fsdp._common_utils import collect_grad_tensors
 from torch.distributed.utils import _apply_to_tensors, _to_kwargs
 
-from . import _fsdp_common
 from ._fsdp_api import MixedPrecisionPolicy
 from ._fsdp_common import _cast_fp_tensor, _dynamo_disable, TrainingState
 from ._fsdp_param_group import FSDPCommContext, FSDPParamGroup
@@ -409,19 +408,16 @@ class FSDPState(_State):
                         fsdp_param_group.finalize_backward()
             if self._state_ctx.is_last_backward:
                 self._comm_ctx.post_forward_order.clear()
-                # Catch the last module's RS states that no subsequent
-                # module's group N-1 wait will clear.
-                if not _fsdp_common._RS_COPY_IN_ON_RS_STREAM:
-                    for rs_state in self._comm_ctx.reduce_scatter_states:
-                        if rs_state.event is not None:
-                            self._device_handle.current_stream().wait_event(
-                                rs_state.event
-                            )
+                # Catch the last module's RS states that no subsequent module's
+                # group N-1 wait will clear. RS-stream-local inputs (copy-in ran
+                # on the RS stream) skip the compute-stream wait.
+                for rs_state in self._comm_ctx.reduce_scatter_states:
+                    if rs_state.needs_compute_stream_wait and rs_state.event is not None:
+                        self._device_handle.current_stream().wait_event(rs_state.event)
                 self._comm_ctx.reduce_scatter_states.clear()
                 # Grads read cross-stream by the RS-stream copy-in: barrier the
                 # compute stream past each copy-in before recycling the grad
-                # memory (keepalive + wait_event-before-del). No-op here since
-                # finalize_backward already waited on the post-reduce events.
+                # memory (keepalive + wait_event-before-del).
                 for g_state in self._comm_ctx.grad_reduce_states:
                     if g_state.copy_in_event is not None:
                         self._device_handle.current_stream().wait_event(
