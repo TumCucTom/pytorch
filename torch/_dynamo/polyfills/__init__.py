@@ -506,7 +506,28 @@ def instantiate_user_defined_class_object(
     # for classes with custom __instancecheck__ (e.g. torch.ByteStorage).
     # Reference: https://github.com/python/cpython/blob/3.12/Objects/typeobject.c#L1670-L1673
     if issubclass(type(obj), cls):
-        obj.__init__(*args, **kwargs)
+        init = type(obj).__init__
+        if init is object.__init__ or (
+            not args
+            and not kwargs
+            and issubclass(type(obj), BaseException)
+            and init in (BaseException.__init__, Exception.__init__)
+        ):
+            return obj
+
+        for base in type(obj).__mro__:
+            if "__init__" in base.__dict__:
+                init = base.__dict__["__init__"]
+                break
+        else:
+            init = object.__init__
+
+        if isinstance(init, staticmethod):
+            init.__func__(*args, **kwargs)
+        elif isinstance(init, classmethod):
+            init.__func__(type(obj), *args, **kwargs)
+        else:
+            type(obj).__init__(obj, *args, **kwargs)
     return obj
 
 

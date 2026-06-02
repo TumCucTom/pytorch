@@ -1667,7 +1667,7 @@ class BuiltinVariable(BaseBuiltinVariable):
                         args=list(e.args),
                     )
 
-        if self.fn is object and name == "__init__":
+        if self.fn is object and name == "__init__" and len(args) == 1 and not kwargs:
             # object.__init__ is a no-op
             return variables.ConstantVariable.create(None)
 
@@ -3180,7 +3180,7 @@ class GetAttrBuiltinVariable(BaseBuiltinVariable):
         ):
             if (
                 isinstance(obj, variables.UserDefinedObjectVariable)
-                and issubclass(obj.value.__class__, unittest.TestCase)
+                and issubclass(type(obj.value), unittest.TestCase)
                 and config.enable_trace_unittest
                 and name
                 in (
