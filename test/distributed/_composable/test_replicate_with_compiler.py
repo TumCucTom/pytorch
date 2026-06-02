@@ -406,6 +406,7 @@ class DDP_TP_Test(InductorTestCase):
         dist.destroy_process_group()
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+    @torch._dynamo.config.patch(optimize_ddp="python_reducer")
     def test_ddp_tp(self):
         ref_model = Net()
         compiled_replicate_model = deepcopy(ref_model)
