@@ -3208,7 +3208,7 @@ def _codegen_compiled_backward(
     lines: list[str] = [
         "def _compiled_backward("
         "_flat_args_, _ctx_, _prologue_,"
-        " _rng_add_, _impl_, _epilogue_, _double_bw_):"
+        " _rng_add_, _impl_, _epilogue_, _double_bw_, _needs_grad_):"
     ]
     code_globals: dict[str, object] = {
         "torch": torch,
@@ -3249,11 +3249,7 @@ def _codegen_compiled_backward(
     )
     lines.append("        impl_fn = functools.partial(_cc.run, impl_fn)")
 
-    lines.append("    _ng = torch.is_grad_enabled() and any(")
-    lines.append(
-        "        t.requires_grad for t in all_args if isinstance(t, torch.Tensor))"
-    )
-    lines.append("    if _ng:")
+    lines.append("    if _needs_grad_(all_args):")
     lines.append("        return _double_bw_(_ctx_, impl_fn, all_args)")
     lines.append("    return impl_fn()")
 
@@ -3474,6 +3470,22 @@ class _AOTDispatchAutogradFunctionFactory:
                     CompiledFunction._backward_impl,
                     CompiledFunction._bw_epilogue_fn,
                     CompiledFunction._double_backward,
+                    CompiledFunction._needs_grad,
+                )
+
+            @staticmethod
+            def _needs_grad(all_args: list[Any]) -> bool:
+                if not torch.is_grad_enabled():
+                    return False
+                if any(
+                    t.requires_grad for t in all_args if isinstance(t, torch.Tensor)
+                ):
+                    return True
+                # autograd.Function.forward runs in no-grad context, so saved
+                # tensors always have requires_grad=False. Fall back to
+                # metadata.input_info to detect create_graph=True.
+                return any(
+                    inp.requires_grad for inp in CompiledFunction.metadata.input_info
                 )
 
             @staticmethod
@@ -3502,6 +3514,10 @@ class _AOTDispatchAutogradFunctionFactory:
                     CompiledFunction._compiled_autograd_key
                 )
 
+                if not any(
+                    t.requires_grad for t in all_args if isinstance(t, torch.Tensor)
+                ):
+                    all_args = [torch.empty(0, requires_grad=True)] + all_args
                 return CompiledFunctionBackward.apply(*all_args)
 
             @staticmethod
