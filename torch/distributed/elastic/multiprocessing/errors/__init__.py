@@ -116,6 +116,7 @@ class ProcessFailure:
     timestamp: int = field(init=False)
 
     def __post_init__(self):
+        original_error_file = self.error_file
         self.error_file_data = _EMPTY_ERROR_DATA
         if os.path.isfile(self.error_file):
             try:
@@ -148,6 +149,31 @@ class ProcessFailure:
                     "retryability": "False",
                 }
                 self.message = "To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html"
+        # For signal failures (no traceback), let the (build-swapped) handler
+        # append device-fault context (e.g. ROCm GPU faults) scanned from the
+        # worker logs. Done here, at failure construction, so it surfaces no
+        # matter how the ChildFailedError is later handled. The base handler is
+        # a no-op (returns the text unchanged), so this is inert in OSS.
+        if self.exitcode < 0:
+            handler = get_error_handler()
+            if isinstance(self.message, str):
+                self.message = handler.maybe_enrich_signal_failure_message(
+                    self.message, original_error_file
+                )
+            elif isinstance(self.message, dict):
+                # Structured reply file (e.g. the fb fatal-signal handler writes
+                # one even for signals). ``format_msg`` renders
+                # ``extraInfo.py_callstack`` for dict messages, so enrich that
+                # field rather than the dict itself.
+                extra_info = self.message.get("extraInfo")
+                if isinstance(extra_info, dict) and isinstance(
+                    extra_info.get("py_callstack"), str
+                ):
+                    extra_info["py_callstack"] = (
+                        handler.maybe_enrich_signal_failure_message(
+                            extra_info["py_callstack"], original_error_file
+                        )
+                    )
 
     def _get_error_data(self, error_file_data: dict[str, Any]) -> tuple[str, int]:
         message = error_file_data["message"]
@@ -378,12 +404,10 @@ def record(
                     error_handler.dump_error_file(failure.error_file, failure.exitcode)
                 else:
                     logger.info(
-                        (
-                            "local_rank %s FAILED with no error file."
-                            " Decorate your entrypoint fn with @record for traceback info."
-                            " See: https://pytorch.org/docs/stable/elastic/errors.html",
-                            rank,
-                        )
+                        "local_rank %s FAILED with no error file."
+                        " Decorate your entrypoint fn with @record for traceback info."
+                        " See: https://pytorch.org/docs/stable/elastic/errors.html",
+                        rank,
                     )
                 raise
             except Exception as e:

@@ -125,6 +125,49 @@ class ApiTest(unittest.TestCase):
             f"Signal {signal.SIGSEGV} (SIGSEGV) received by PID {pf.pid}", pf.message
         )
 
+    def test_process_failure_signal_message_enriched(self):
+        # Signal failures are routed through the handler's enrichment seam; the
+        # (build-swapped) handler may append device-fault context to the message.
+        handler = mock.MagicMock()
+        handler.maybe_enrich_signal_failure_message.side_effect = (
+            lambda message, error_file: message + "\n[device fault context]"
+        )
+        with mock.patch(
+            "torch.distributed.elastic.multiprocessing.errors.get_error_handler",
+            return_value=handler,
+        ):
+            pf = self.failure_without_error_file(exitcode=-signal.SIGABRT)
+        self.assertIn("[device fault context]", pf.message)
+
+    def test_process_failure_dict_message_enriched(self):
+        # For a structured (dict) error file, the seam enriches the rendered
+        # py_callstack rather than the dict itself.
+        error_data = {
+            "message": {
+                "message": "boom",
+                "extraInfo": {"py_callstack": "trace", "timestamp": "1"},
+            }
+        }
+        with open(self.test_error_file, "w") as fp:
+            json.dump(error_data, fp)
+        handler = mock.MagicMock()
+        handler.maybe_enrich_signal_failure_message.side_effect = (
+            lambda message, error_file: message + "\n[device fault context]"
+        )
+        with mock.patch(
+            "torch.distributed.elastic.multiprocessing.errors.get_error_handler",
+            return_value=handler,
+        ):
+            pf = ProcessFailure(
+                local_rank=0,
+                pid=997,
+                exitcode=-signal.SIGABRT,
+                error_file=self.test_error_file,
+            )
+        self.assertEqual(
+            "trace\n[device fault context]", pf.message["extraInfo"]["py_callstack"]
+        )
+
     def test_process_failure_no_error_file(self):
         pf = self.failure_without_error_file(exitcode=138)
         self.assertEqual("<N/A>", pf.signal_name())
