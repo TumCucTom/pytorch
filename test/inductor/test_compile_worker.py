@@ -1,7 +1,11 @@
 # Owner(s): ["module: inductor"]
 import operator
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
+import unittest
 from threading import Event
 
 import torch._inductor.config as config
@@ -12,7 +16,7 @@ from torch._inductor.compile_worker.subproc_pool import (
 )
 from torch._inductor.compile_worker.timer import Timer
 from torch._inductor.test_case import TestCase
-from torch.testing._internal.common_utils import skipIfWindows
+from torch.testing._internal.common_utils import IS_FBCODE, IS_LINUX, skipIfWindows
 from torch.testing._internal.inductor_utils import HAS_CPU
 
 
@@ -73,6 +77,7 @@ class TestCompileWorker(TestCase):
         finally:
             pool.shutdown()
 
+    @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/176968")
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_quiesce_repeatedly(self):
         pool = SubprocPool(2)
@@ -102,6 +107,53 @@ class TestCompileWorker(TestCase):
                 self.assertEqual(os.path.exists(temp_log.name), True)
             finally:
                 pool.shutdown()
+
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
+    def test_shutdown_terminates_sidecar_worker_pool(self):
+        code = textwrap.dedent(
+            """
+            import operator
+            import subprocess
+            import time
+
+            from torch._inductor.compile_worker.subproc_pool import SubprocPool
+
+            pool = SubprocPool(2)
+            assert pool.submit(operator.add, 1, 2).result() == 3
+            pool.submit(time.sleep, 5)
+            time.sleep(0.5)
+
+            wait = pool.process.wait
+
+            def short_wait(timeout=None):
+                return wait(timeout=2)
+
+            pool.process.wait = short_wait
+
+            try:
+                pool.shutdown()
+            except subprocess.TimeoutExpired:
+                pool.process.kill()
+                pool.process.wait()
+                raise
+
+            print("shutdown returned")
+            """
+        )
+        with tempfile.TemporaryDirectory() as cwd:
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("shutdown returned", result.stdout)
 
 
 @config.patch("quiesce_async_compile_time", 0.1)
@@ -161,6 +213,119 @@ class TestTimer(TestCase):
             t.record_call()
         self.assertTrue(done.wait(4))
         t.quit()
+
+
+class TestSetTritonLibdevicePath(TestCase):
+    @unittest.skipIf(
+        IS_FBCODE,
+        "knobs.nvidia.libdevice_path mismatch in fbcode CI environment; "
+        "matches sibling test_libdevice_path_* disables",
+    )
+    @config.patch({"compile_threads": 1, "emulate_precision_casts": True})
+    def test_emulate_precision_casts_sets_libdevice_path(self):
+        """Test eager numerics mode sets libdevice path for CUDA libdevice calls."""
+        self._test_libdevice_path_with_compilation()
+
+    @config.patch({"compile_threads": 1, "eager_numerics.use_pytorch_libdevice": True})
+    def test_libdevice_path_no_subprocess(self):
+        """Test libdevice path is set with compile_threads=1 (no subprocess)."""
+        self._test_libdevice_path_with_compilation()
+
+    @config.patch("eager_numerics.use_pytorch_libdevice", True)
+    def test_libdevice_path_default_threads(self):
+        """Test libdevice path is set with default compile_threads (subprocess)."""
+        self._test_libdevice_path_with_compilation()
+
+    @config.patch(
+        {
+            "eager_numerics.use_pytorch_libdevice": True,
+            "eager_numerics.division_rounding": True,
+            "emulate_precision_casts": True,
+            "compile_threads": 1,
+        }
+    )
+    def test_pow_bitwise_precision(self):
+        """Test that compiled pow matches eager bitwise with system libdevice."""
+        import torch
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        if CUDA_HOME is None:
+            self.skipTest("CUDA_HOME not set")
+        expected = os.path.join(CUDA_HOME, "nvvm", "libdevice", "libdevice.10.bc")
+        if not os.path.isfile(expected):
+            self.skipTest(f"libdevice not found at {expected}")
+
+        torch._dynamo.reset()
+        torch.manual_seed(42)
+        base = torch.randn(1000, device="cuda", dtype=torch.float32).abs() + 1e-6
+        exp = torch.randn(1000, device="cuda", dtype=torch.float32)
+
+        eager_result = torch.pow(base, exp)
+        compiled_result = torch.compile(torch.pow)(base, exp)
+        self.assertEqual(eager_result, compiled_result, atol=0, rtol=0)
+
+    @config.patch({"compile_threads": 1, "emulate_precision_casts": True})
+    def test_erf_bitwise_precision_with_emulate_precision_casts(self):
+        """Test that erf matches eager bitwise when eager numerics mode is active."""
+        import torch
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        if CUDA_HOME is None:
+            self.skipTest("CUDA_HOME not set")
+        expected = os.path.join(CUDA_HOME, "nvvm", "libdevice", "libdevice.10.bc")
+        if not os.path.isfile(expected):
+            self.skipTest(f"libdevice not found at {expected}")
+
+        torch._dynamo.reset()
+        values = torch.tensor(
+            [
+                -3.9194295406341553,
+                -3.9188895225524902,
+                0.0,
+                1.0,
+                3.9194295406341553,
+            ],
+            device="cuda",
+            dtype=torch.float32,
+        )
+
+        def fn(x):
+            return torch.erf(x)
+
+        eager_result = fn(values)
+        compiled_result = torch.compile(fn)(values)
+        self.assertEqual(eager_result, compiled_result, atol=0, rtol=0)
+
+    def _test_libdevice_path_with_compilation(self):
+        import torch
+        from torch.utils.cpp_extension import CUDA_HOME
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+
+        if CUDA_HOME is None:
+            self.skipTest("CUDA_HOME not set")
+
+        expected = os.path.join(CUDA_HOME, "nvvm", "libdevice", "libdevice.10.bc")
+        if not os.path.isfile(expected):
+            self.skipTest(f"libdevice not found at {expected}")
+
+        # Compile a simple function that uses pow (which uses libdevice)
+        @torch.compile
+        def fn(x):
+            return torch.pow(x, 2.0)
+
+        x = torch.randn(10, device="cuda", dtype=torch.float32)
+        fn(x)
+
+        # Verify libdevice path was set
+        from triton import knobs
+
+        self.assertEqual(knobs.nvidia.libdevice_path, expected)
 
 
 if __name__ == "__main__":

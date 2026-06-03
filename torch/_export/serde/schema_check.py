@@ -3,9 +3,10 @@ import dataclasses
 import hashlib
 import inspect
 import re
+import types
 import typing
 from enum import IntEnum
-from typing import Annotated, Any, ForwardRef, Optional, Union
+from typing import Annotated, Any, ForwardRef, Union
 
 from torch._export.serde import schema
 from torch._export.serde.union import _Union
@@ -81,7 +82,7 @@ def _staged_schema():
                         "map<",
                         ">",
                     )
-                elif o == Union:
+                elif o is Union or o is types.UnionType:
                     if level != 0:
                         raise AssertionError(
                             f"Optional is only supported at the top level, got level={level}"
@@ -134,10 +135,10 @@ def _staged_schema():
                     f"Default value {v} is not supported yet in export schema."
                 )
 
-        def dump_field(f) -> tuple[dict[str, Any], str, Optional[str], str, int]:
+        def dump_field(f) -> tuple[dict[str, Any], str, str | None, str, int]:
             t, cpp_type, thrift_type = dump_type(f.type, 0)
             ret = {"type": t}
-            cpp_default: Optional[str] = None
+            cpp_default: str | None = None
             if typing.get_origin(f.type) is not Annotated:
                 raise AssertionError(
                     f"Field {f.name} must be annotated with an integer id."
@@ -163,6 +164,21 @@ def _staged_schema():
                     raise AssertionError(
                         f"Optional field {ty.__name__}.{f.name} must have default value to be None."
                     )
+
+                # Skip emitting "= {}" for non-primitive types whose
+                # default-construction already yields the same empty value
+                # (containers, strings, classes). Emitting it would trigger
+                # readability-redundant-member-init. Keep it for primitives
+                # (int64_t, bool, F64) which require explicit value-init.
+                if cpp_default == "{}" and cpp_type not in ("int64_t", "bool", "F64"):
+                    cpp_default = None
+            elif cpp_type in ("int64_t", "bool", "F64"):
+                # Value-initialize primitive/enum members (enums map to int64_t)
+                # to satisfy cppcoreguidelines-pro-type-member-init. Non-primitive
+                # types (std::string, containers, classes) default-construct
+                # themselves; emitting "= {}" for those would trigger
+                # readability-redundant-member-init.
+                cpp_default = "{}"
 
             return ret, cpp_type, cpp_default, thrift_type, thrift_id
 
@@ -235,14 +251,15 @@ enum {name} {{
     return {name};
   }}
 
-  void set_{name}({ty} def) {{
-    {name} = std::move(def);
+  template <typename U>
+  void set_{name}(U&& def) {{
+    {name} = std::forward<U>(def);
   }}
 """
 
         to_json_decl = f"void to_json(nlohmann::json& nlohmann_json_j, const {name}& nlohmann_json_t)"
         to_json_def = f"""{{
-{chr(10).join([f'  nlohmann_json_j["{name}"] = nlohmann_json_t.{name};' for name, f in cpp_fields.items()])}
+{chr(10).join([f'  nlohmann_json_j["{name}"] = nlohmann_json_t.{name};' for name in cpp_fields])}
 }}
 """
         from_json_decl = f"void from_json(const nlohmann::json& nlohmann_json_j, {name}& nlohmann_json_t)"
@@ -253,7 +270,7 @@ enum {name} {{
             chr(10).join(
                 [
                     f'  nlohmann_json_t.{name} = nlohmann_json_j.value("{name}", nlohmann_json_default_obj.{name});'
-                    for name, f in cpp_fields.items()
+                    for name in cpp_fields
                 ]
             )
         }
@@ -289,8 +306,9 @@ struct {name} {{
     return std::get<{idx + 1}>(variant_);
   }}
 
-  void set_{name}({ty} def) {{
-    variant_.emplace<{idx + 1}>(std::move(def));
+  template <typename U>
+  void set_{name}(U&& def) {{
+    variant_.emplace<{idx + 1}>(std::forward<U>(def));
     tag_ = Tag::{name.upper()};
   }}
 """
@@ -328,7 +346,7 @@ class {name} {{
 
  private:
   std::variant<Void, {", ".join(f["cpp_type"] for f in cpp_fields.values())}> variant_;
-  Tag tag_;
+  Tag tag_{{}};
 
  public:
   Tag tag() const {{
@@ -455,8 +473,7 @@ struct adl_serializer<std::optional<T>> {{
 }};
 NLOHMANN_JSON_NAMESPACE_END
 
-namespace torch {{
-namespace _export {{
+namespace torch::_export {{
 
 template <typename T>
 class ForwardRef {{
@@ -464,9 +481,9 @@ class ForwardRef {{
 
  public:
   ForwardRef(): ptr_(std::make_unique<T>()) {{}}
-  ForwardRef(ForwardRef<T>&&);
+  ForwardRef(ForwardRef<T>&&) noexcept;
   ForwardRef(const ForwardRef<T>& other): ptr_(std::make_unique<T>(*other.ptr_)) {{}}
-  ForwardRef<T>& operator=(ForwardRef<T>&&);
+  ForwardRef<T>& operator=(ForwardRef<T>&&) noexcept;
   ForwardRef<T>& operator=(const ForwardRef<T>& other) {{
     ptr_ = std::make_unique<T>(*other.ptr_);
     return *this;
@@ -509,7 +526,7 @@ class F64 {{
   }}
 
  private:
-  double value_;
+  double value_{{}};
 }};
 
 inline void to_json(nlohmann::json& j, const F64& f) {{
@@ -541,11 +558,10 @@ inline void from_json(const nlohmann::json& j, F64& f) {{
 {"".join(dict(sorted(cpp_class_defs.items(), key=lambda x: class_ordering[x[0]])).values())}
 {chr(10).join(cpp_json_defs)}
 
-template <typename T> ForwardRef<T>::ForwardRef(ForwardRef<T>&&) = default;
-template <typename T> ForwardRef<T>& ForwardRef<T>::operator=(ForwardRef<T>&&) = default;
+template <typename T> ForwardRef<T>::ForwardRef(ForwardRef<T>&&) noexcept = default;
+template <typename T> ForwardRef<T>& ForwardRef<T>::operator=(ForwardRef<T>&&) noexcept = default;
 template <typename T> ForwardRef<T>::~ForwardRef() = default;
-}} // namespace _export
-}} // namespace torch
+}} // namespace torch::_export
 """
     thrift_schema = f"""
 namespace py3 torch._export
@@ -752,13 +768,13 @@ class _Commit:
     additions: dict[str, Any]
     subtractions: dict[str, Any]
     base: dict[str, Any]
-    checksum_head: Optional[str]
+    checksum_head: str | None
     cpp_header: str
     cpp_header_path: str
     enum_converter_header: str
     enum_converter_header_path: str
-    thrift_checksum_head: Optional[str]
-    thrift_checksum_real: Optional[str]
+    thrift_checksum_head: str | None
+    thrift_checksum_real: str | None
     thrift_checksum_next: str
     thrift_schema: str
     thrift_schema_path: str
@@ -882,7 +898,7 @@ def check(commit: _Commit, force_unsafe: bool = False):
             for k, v in commit.additions.items():
                 for f in v["fields"]:
                     reason += (
-                        f"Field {k}.{f} is added to schema.py as an compatible change "
+                        f"Field {k}.{f} is added to schema.py as a compatible change "
                         + "which still requires minor version bump.\n"
                     )
             next_version = [
@@ -893,7 +909,7 @@ def check(commit: _Commit, force_unsafe: bool = False):
             for k, v in commit.subtractions.items():
                 for f in v["fields"]:
                     reason += (
-                        f"Field {k}.{f} is removed from schema.py as an compatible change "
+                        f"Field {k}.{f} is removed from schema.py as a compatible change "
                         + "which still requires minor version bump.\n"
                     )
             next_version = [

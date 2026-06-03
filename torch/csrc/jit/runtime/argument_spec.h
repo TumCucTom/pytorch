@@ -6,6 +6,7 @@
 #include <c10/util/irange.h>
 #include <torch/csrc/Export.h>
 #include <torch/csrc/autograd/variable.h>
+#include <torch/csrc/jit/ir/ir.h>
 #include <ostream>
 #include <vector>
 
@@ -15,13 +16,6 @@ C10_CLANG_DIAGNOSTIC_IGNORE("-Wshorten-64-to-32")
 #endif
 
 namespace torch::jit {
-
-struct Graph;
-
-template <typename T>
-using ArrayRef = at::ArrayRef<T>;
-using ::c10::TensorType;
-using ::c10::TypePtr;
 
 // GraphExecutor creates specializations of Graphs for different
 // dimensionalitities and types of inputs.
@@ -187,7 +181,7 @@ struct TORCH_API ArgumentSpecCreator {
     ENTER_OBJECT, // same as ENTER_TUPLE, but the input is a class
     LEAVE, // pop the top-most list from the stack
     SKIP, // consume an element from the top-most list, and discard
-    SPECIALIZE_OPTIONAL_TENSOR, // consume a optional tensor for the top-most
+    SPECIALIZE_OPTIONAL_TENSOR, // consume an optional tensor for the top-most
                                 // list, and add it to the ArgSpec key being
                                 // created
     SPECIALIZE_TENSOR, // consume a tensor for the top-most

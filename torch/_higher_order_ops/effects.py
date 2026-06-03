@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.utils._pytree as pytree
@@ -46,7 +46,7 @@ def _get_op_qualname(op: _op_identifier) -> str:
 
 
 def _register_effectful_op(
-    op: _op_identifier, effect: Optional[EffectType]
+    op: _op_identifier, effect: EffectType | None
 ) -> RegistrationHandle:
     qualname = _get_op_qualname(op)
     entry = torch._library.simple_registry.singleton.find(qualname)
@@ -54,13 +54,16 @@ def _register_effectful_op(
     return handle
 
 
-def _get_effect(op: _op_identifier) -> Optional[_EffectType]:
+def _get_effect(op: _op_identifier) -> _EffectType | None:
     qualname = _get_op_qualname(op)
     entry = torch._library.simple_registry.singleton.find(qualname)
     return entry.effect.effect
 
 
 _register_effectful_op("aten::_print", _EffectType.ORDERED)
+# _linalg_check_errors has no tensor output, but it raises on invalid linalg
+# results and must be preserved by functionalization/DCE.
+_register_effectful_op("aten::_linalg_check_errors", _EffectType.ORDERED)
 _register_effectful_op("profiler::_record_function_exit._RecordFunction", None)
 _register_effectful_op(call_torchbind, _EffectType.ORDERED)
 _register_effectful_op(hop_print, _EffectType.ORDERED)
@@ -220,7 +223,7 @@ def with_effects_functional(
 _EFFECTFUL_HOPS_WITH_SCHEMA = {hop_print, invoke_leaf_function}
 
 
-def _get_schema(op, args, kwargs: Optional[dict] = None) -> torch.FunctionSchema:
+def _get_schema(op, args, kwargs: dict | None = None) -> torch.FunctionSchema:
     if isinstance(op, torch._ops.OpOverload):
         return op._schema
     elif op == call_torchbind:
