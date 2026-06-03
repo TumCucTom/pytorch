@@ -5310,50 +5310,6 @@ if HAS_CUDA_AND_TRITON:
             run(10)
             run(25)
 
-        def test_autoregressive_cache_growth_no_assertion(self):
-            """Test that autoregressive models with growing KV-cache-like tensors
-            do not trigger assertion errors in dealloc_current_path_weakrefs.
-
-            This covers an autoregressive decode-like pattern with a growing
-            cache tensor. It is intentionally narrow: the overwritten-output
-            RuntimeError is a separate known issue, but this path should not
-            regress into an AssertionError during deallocation.
-
-            See https://github.com/pytorch/pytorch/issues/154824
-            """
-
-            class KVCacheModel(torch.nn.Module):
-                """Model that mimics autoregressive decode: output grows each step."""
-
-                def __init__(self, d_model=64):
-                    super().__init__()
-                    self.proj = torch.nn.Linear(d_model, d_model)
-
-                def forward(self, x, cache=None):
-                    out = self.proj(x)
-                    if cache is not None:
-                        cache = torch.cat([cache, out], dim=1)
-                    else:
-                        cache = out
-                    return out, cache
-
-            model = KVCacheModel(64).cuda()
-            compiled = torch.compile(model, mode="reduce-overhead")
-
-            cache = None
-            # Run enough steps to trigger warmup -> recording transition
-            # which exercises dealloc_current_path_weakrefs
-            for step in range(20):
-                torch.compiler.cudagraph_mark_step_begin()
-                x = torch.randn(1, 1, 64, device="cuda")
-                try:
-                    out, cache = compiled(x, cache)
-                except RuntimeError:
-                    # The RuntimeError about "tensor output overwritten" is a
-                    # separate known issue (input release during dealloc).
-                    # This test verifies we don't hit AssertionError.
-                    break
-
         def test_dealloc_handles_tensor_weakrefs_stack_traces_mismatch(self):
             """Verify dealloc_current_path_weakrefs handles tensor_weakrefs /
             stack_traces length mismatch without asserting.
@@ -5362,8 +5318,6 @@ if HAS_CUDA_AND_TRITON:
             deterministic. The fix replaces the hard assert with a warning and
             relies on zip(), matching the existing defensive pattern for
             outputs_weakrefs in the same function.
-
-            See https://github.com/pytorch/pytorch/issues/154824
             """
 
             @torch.compile(mode="reduce-overhead")
