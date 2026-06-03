@@ -632,6 +632,128 @@ class BlockDescriptorOptions:
     def has_mask(self) -> bool:
         return bool(self.boundary_check())
 
+    @dataclasses.dataclass(frozen=True)
+    class _BroadcastAndReshapePlan:
+        broadcast_shape: Sequence[sympy.Expr]
+        pre_broadcast_shape: Sequence[sympy.Expr]
+        supports_implicit_broadcast: bool
+        permute_dims: Sequence[int] | None
+        old_shape: Sequence[sympy.Expr]
+
+    def _broadcast_and_reshape_plan(
+        self,
+        final_shape: Sequence[sympy.Expr],
+        allow_implicit: bool,
+        for_store: bool,
+    ) -> _BroadcastAndReshapePlan:
+        broadcast_shape = self.broadcast_shape
+        broadcasting_dims = self.broadcasting_dims
+
+        # If the block parameters have been sorted by descending strides,
+        # permute the broadcasting parameters so that they are compatible
+        # with the value being stored. This is because the dimensions
+        # of the value being stored are not sorted in descending stride order,
+        # but the broadcasting parameters are based on the dims in sorted order
+        if for_store:
+            broadcast_shape = self.stride_sorter.revert(self.broadcast_shape)
+            broadcasting_dims = self.stride_sorter.revert(self.broadcasting_dims)
+
+        # Reshape to add singletons.
+        pre_broadcast_shape = [
+            sympy.S.One if is_broadcasting else dim
+            for dim, is_broadcasting in zip(broadcast_shape, broadcasting_dims)
+        ]
+
+        implicit_broadcast_shape = pre_broadcast_shape
+        if (
+            not self.stride_sorter.is_identity
+            and not for_store
+            and len(pre_broadcast_shape) == len(final_shape)
+        ):
+            # If all we need to do is transpose to match the final shape
+            # with implicit broadcasting then we don't need an explicit broadcast
+            # unless the caller requests it. So just test implicit broadcast support
+            # with the transposed pre broadcast shape
+            implicit_broadcast_shape = self.stride_sorter.revert(pre_broadcast_shape)
+
+        # Broadcast singletons.
+        # For loads, we can often implicitly broadcast singleton dimensions.
+        # We need an explicit broadcast for stores, or if the final reshape does more
+        # than add singletons.
+        sizevars = V.graph.sizevars
+        supports_implicit_broadcast = allow_implicit and (
+            len(implicit_broadcast_shape) == len(final_shape)
+            and all(
+                sizevars.statically_known_equals(pre_dim, 1)
+                or sizevars.statically_known_equals(pre_dim, post_dim)
+                for pre_dim, post_dim in zip(implicit_broadcast_shape, final_shape)
+            )
+        )
+
+        old_shape = self.broadcast_shape
+        permute_dims = None
+        if not self.stride_sorter.is_identity:
+            # if for_store the transform is
+            #   (non-descending strides) broadcasted kernel tile shape
+            #       -> (descending strides) block descriptor shape
+            # o/w if loading the transform is
+            #   (descending strides) ((maybe implicitly) broadcasted block shape
+            #       -> (non-descending) (maybe implicitly) broadcasted kernel tile shape
+            permute_dims = (
+                self.stride_sorter.sort_idx
+                if for_store
+                else self.stride_sorter.revert_sort_idx
+            )
+            old_shape = (
+                self.broadcast_shape
+                if for_store
+                else self.stride_sorter.revert(self.broadcast_shape)
+            )
+
+        return BlockDescriptorOptions._BroadcastAndReshapePlan(
+            broadcast_shape=broadcast_shape,
+            pre_broadcast_shape=pre_broadcast_shape,
+            supports_implicit_broadcast=supports_implicit_broadcast,
+            permute_dims=permute_dims,
+            old_shape=old_shape,
+        )
+
+    @staticmethod
+    def _shape_after_reshape(
+        old_shape: Sequence[sympy.Expr | int | str],
+        new_shape: Sequence[sympy.Expr | int | str],
+    ) -> Sequence[sympy.Expr | int | str]:
+        if triton_shape_dims(old_shape) == triton_shape_dims(new_shape):
+            return old_shape
+        return new_shape
+
+    def broadcast_and_reshape_shape(
+        self,
+        initial_shape: Sequence[sympy.Expr],
+        final_shape: Sequence[sympy.Expr],
+        allow_implicit: bool,
+        for_store: bool,
+    ) -> Sequence[sympy.Expr | int | str]:
+        plan = self._broadcast_and_reshape_plan(
+            final_shape,
+            allow_implicit,
+            for_store,
+        )
+
+        current_shape = self._shape_after_reshape(
+            initial_shape, plan.pre_broadcast_shape
+        )
+
+        if any(self.broadcasting_dims) and not plan.supports_implicit_broadcast:
+            current_shape = plan.broadcast_shape
+
+        if plan.permute_dims is not None:
+            current_shape = [current_shape[i] for i in plan.permute_dims]
+
+        if triton_shape_dims(plan.old_shape) == triton_shape_dims(final_shape):
+            return current_shape
+        return final_shape
+
     def codegen_broadcast_and_reshape(
         self,
         value: str,
@@ -657,79 +779,21 @@ class BlockDescriptorOptions:
             - Then transpose the value so that dimensions no longer have descending strides
             - Finally reshape the block to the final kernel tile shape
         """
-        broadcast_shape = self.broadcast_shape
-        broadcasting_dims = self.broadcasting_dims
-
-        # If the block parameters have been sorted by descending strides,
-        # permute the broadcasting parameters so that they are compatible
-        # with the value being stored. This is because the dimensions
-        # of the value being stored are not sorted in descending stride order,
-        # but the broadcasting parameters are based on the dims in sorted order
-        if for_store:
-            broadcast_shape = self.stride_sorter.revert(self.broadcast_shape)
-            broadcasting_dims = self.stride_sorter.revert(self.broadcasting_dims)
-
-        # Reshape to add singletons.
-        pre_broadcast_shape = [
-            sympy.S.One if is_broadcasting else dim
-            for dim, is_broadcasting in zip(broadcast_shape, broadcasting_dims)
-        ]
-        value = triton_reshape(value, initial_shape, pre_broadcast_shape)
-
-        if (
-            not self.stride_sorter.is_identity
-            and not for_store
-            and len(pre_broadcast_shape) == len(final_shape)
-        ):
-            # If all we need to do is transpose to match the final shape
-            # with implicit broadcasting then we don't need an explicit broadcast
-            # unless the caller requests it. So just test implicit broadcast support
-            # with the transposed pre broadcast shape
-            pre_broadcast_shape = self.stride_sorter.revert(pre_broadcast_shape)
-
-        # Broadcast singletons.
-        # For loads, we can often implicitly broadcast singleton dimensions.
-        # We need an explicit broadcast for stores, or if the final reshape does more
-        # than add singletons.
-        sizevars = V.graph.sizevars
-        supports_implicit_broadcast = allow_implicit and (
-            len(pre_broadcast_shape) == len(final_shape)
-            and all(
-                sizevars.statically_known_equals(pre_dim, 1)
-                or sizevars.statically_known_equals(pre_dim, post_dim)
-                for pre_dim, post_dim in zip(pre_broadcast_shape, final_shape)
-            )
+        plan = self._broadcast_and_reshape_plan(
+            final_shape,
+            allow_implicit,
+            for_store,
         )
+        value = triton_reshape(value, initial_shape, plan.pre_broadcast_shape)
 
-        if any(self.broadcasting_dims) and not supports_implicit_broadcast:
-            value = (
-                f"tl.broadcast_to({value}, {V.kernel.index_to_str(broadcast_shape)})"
-            )
+        if any(self.broadcasting_dims) and not plan.supports_implicit_broadcast:
+            value = f"tl.broadcast_to({value}, {V.kernel.index_to_str(plan.broadcast_shape)})"
 
-        old_shape = self.broadcast_shape
-        if not self.stride_sorter.is_identity:
-            # if for_store the transform is
-            #   (non-descending strides) broadcasted kernel tile shape
-            #       -> (descending strides) block descriptor shape
-            # o/w if loading the transform is
-            #   (descending strides) ((maybe implicitly) broadcasted block shape
-            #       -> (non-descending) (maybe implicitly) broadcasted kernel tile shape
-            permute_dims = (
-                self.stride_sorter.sort_idx
-                if for_store
-                else self.stride_sorter.revert_sort_idx
-            )
-            value = f"tl.trans({value}, {permute_dims})"
-            old_shape = (
-                self.broadcast_shape
-                if for_store
-                else self.stride_sorter.revert(self.broadcast_shape)
-            )
+        if plan.permute_dims is not None:
+            value = f"tl.trans({value}, {plan.permute_dims})"
 
         # Reshape to the final shape.
-        value = triton_reshape(value, old_shape, final_shape)
-
-        return value
+        return triton_reshape(value, plan.old_shape, final_shape)
 
 
 @dataclasses.dataclass
@@ -3969,6 +4033,34 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         else:
             return self.loads
 
+    def _range_tree_mask_shape(self, mask: str) -> BlockShapeType:
+        for tree in self.active_range_trees():
+            if tree.owns_mask(mask):
+                return tree.mask_shape(self.triton_tensor_ndim())
+        return None
+
+    def _mask_shape(self, mask: str | TritonCSEVariable) -> BlockShapeType:
+        if isinstance(mask, TritonCSEVariable):
+            return mask.shape
+        return self._range_tree_mask_shape(mask)
+
+    def _broadcast_shape_with_masks(
+        self,
+        shape: BlockShapeType,
+        mask_vars: OrderedSet[str | TritonCSEVariable],
+    ) -> BlockShapeType:
+        if shape is None:
+            return None
+
+        result_shape = tuple(shape)
+        for mask in mask_vars:
+            mask_shape = self._mask_shape(mask)
+            if mask_shape is None:
+                return None
+            result_shape = get_broadcasted_shape(result_shape, tuple(mask_shape))
+
+        return result_shape
+
     GDC_WAIT = "tl.extra.cuda.gdc_wait()"
     GDC_LAUNCH = "tl.extra.cuda.gdc_launch_dependents()"
 
@@ -4183,7 +4275,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     allow_implicit=True,
                     for_store=False,
                 )
-                shape = indexing.final_shape
+                shape = indexing.broadcast_and_reshape_shape(
+                    indexing.block_shape,
+                    indexing.final_shape,
+                    allow_implicit=True,
+                    for_store=False,
+                )
             elif is_sympy_integer_like(original_index):
                 line = f"tl.load({var} + ({original_index}))"
                 append_broadcast = indexing.expand_str
@@ -4241,7 +4338,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
                 line = f"tl.where({indexing.mask_str}, {result_var}, {other_val})"
                 result_var = self.cse.generate(
-                    load_buffer, line, dtype=dtype, shape=result_var.shape
+                    load_buffer,
+                    line,
+                    dtype=dtype,
+                    shape=self._broadcast_shape_with_masks(
+                        result_var.shape, indexing.mask_vars
+                    ),
                 )
 
         if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
@@ -4662,22 +4764,30 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         acc_type = triton_acc_type(src_dtype)
         torch_acc_type = upcast_acc_dtype(src_dtype)
+        index_dtype = (
+            self.features.select_index_dtype()
+            if reduction_type in arg_reduction_types
+            else None
+        )
         result_shape = list(self.dense_size_list())
-        result_shape[dim] = "1"
+        for i in range(dim, dim + self.num_reduction_dims):
+            result_shape[i] = "1"
         result_mask_vars = OrderedSet(
             var for var in masks if not prefix_is_reduction(var[0])
         )
         result_var: Any
         if reduction_type in arg_with_value_reduction_types:
+            assert index_dtype is not None
             result_var = (
                 self.cse.newvar(dtype=torch_acc_type, shape=tuple(result_shape)),
-                self.cse.newvar(
-                    dtype=V.kernel.get_index_dtype_as_torch_dtype(),
-                    shape=tuple(result_shape),
-                ),
+                self.cse.newvar(dtype=index_dtype, shape=tuple(result_shape)),
             )
             for var in result_var:
                 var.mask_vars = result_mask_vars
+        elif reduction_type in arg_index_reduction_types:
+            assert index_dtype is not None
+            result_var = self.cse.newvar(dtype=index_dtype, shape=tuple(result_shape))
+            result_var.mask_vars = result_mask_vars
         else:
             result_var = self.cse.newvar(
                 dtype=torch_acc_type, shape=tuple(result_shape)
@@ -4742,15 +4852,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
             if reduction_type in arg_reduction_types:
                 assert isinstance(masked_value, CSEVariable)
-                accumulator_dtype = V.kernel.get_index_dtype_as_torch_dtype()
+                assert index_dtype is not None
                 if logical_index:
-                    accumulator_index = f"({str(logical_index)}).to({self.dtype_to_str(accumulator_dtype)})"
+                    accumulator_index = (
+                        f"({str(logical_index)}).to({self.dtype_to_str(index_dtype)})"
+                    )
                 else:
                     accumulator_index = str(
                         self.cse.generate(
                             self.compute,
                             f"tl.broadcast_to({reduction_range_prefix}index, {masked_value}.shape)",
-                            dtype=accumulator_dtype,
+                            dtype=index_dtype,
                             shape=masked_value.shape,
                         )
                     )
@@ -4762,8 +4874,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     accumulator_index,
                     argreduce_result_kind(),
                 )
-                if reduction_type in arg_index_reduction_types:
-                    cast(Any, result_var).dtype = accumulator_dtype
             elif reduction_type == "welford_reduce":
                 if self.cooperative_reduction:
                     # cooperative reductions require full welford for correctness
@@ -4843,7 +4953,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
             if reduction_type in arg_reduction_types:
                 accumulator_index = f"_{result_prefix}_index"
-                index_dtype = self.features.select_index_dtype()
+                assert index_dtype is not None
                 self.body.writeline(
                     f"{accumulator_index} = tl.full({self.dense_size_str()}, "
                     f"{torch.iinfo(index_dtype).max}, {self.dtype_to_str(index_dtype)})"
